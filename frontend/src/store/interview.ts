@@ -54,6 +54,8 @@ interface InterviewState {
   setProblem: (p: Problem) => void;
   setCode: (code: string) => void;
   setLanguage: (lang: string) => void;
+  /** 恢复本地草稿：同时切换到草稿语言并将代码基线设为草稿内容 */
+  applyDraftCode: (language: string, code: string) => void;
   setIsRunning: (running: boolean) => void;
   setIsSubmitting: (submitting: boolean) => void;
   setLastRunResult: (result: ExecutionResult | null) => void;
@@ -101,6 +103,14 @@ export const useInterviewStore = create<InterviewState>((set) => ({
       executionHistory: [],
     });
   },
+  applyDraftCode: (lang, draftCode) => set({
+    language: lang,
+    code: draftCode,
+    originalCode: getDefaultCodeByLanguage(lang),
+    lastRunResult: null,
+    lastSubmissionResult: null,
+    executionHistory: [],
+  }),
   setIsRunning: (running) => set({ isRunning: running }),
   setIsSubmitting: (submitting) => set({ isSubmitting: submitting }),
   setLastRunResult: (result) => set({ lastRunResult: result }),

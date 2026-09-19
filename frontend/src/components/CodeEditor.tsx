@@ -1,8 +1,18 @@
-import React, { useState, useCallback, useEffect, useMemo } from 'react';
+import React, { useState, useCallback, useEffect, useMemo, useRef } from 'react';
 import Editor from '@monaco-editor/react';
 import { useInterviewStore, ExecutionResult } from '../store/interview';
 import { SubmissionResult } from './SubmissionResult';
-import { LANGUAGE_CONFIGS, getLanguageConfig, LanguageConfig } from '../types';
+import { LANGUAGE_CONFIGS, getLanguageConfig, LanguageConfig, getDefaultCodeByLanguage } from '../types';
+import {
+  CodeDraft,
+  DraftDiffStats,
+  computeDraftDiff,
+  formatDraftTime,
+  getDraft,
+  isRecoverableDraft,
+  removeDraft,
+  saveDraft,
+} from '../services/codeDraftService';
 
 interface CodeEditorProps {
   disabled?: boolean;
@@ -24,6 +34,7 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
     setCode,
     language,
     setLanguage,
+    applyDraftCode,
     originalCode,
     isRunning,
     isSubmitting,
@@ -34,6 +45,7 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
     addExecutionHistory,
     updateExecutionHistory,
     currentProblem,
+    currentUser,
     lastRunResult,
     lastSubmissionResult,
     executionHistory,
@@ -45,8 +57,223 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
   const [codeModified, setCodeModified] = useState(false);
   const [codeChangeIndicator, setCodeChangeIndicator] = useState(false);
   const [showLanguageDropdown, setShowLanguageDropdown] = useState(false);
+  const [draftModalOpen, setDraftModalOpen] = useState(false);
+  const [draftChecking, setDraftChecking] = useState(false);
+  const [pendingDraft, setPendingDraft] = useState<CodeDraft | null>(null);
+  const [draftCheckError, setDraftCheckError] = useState<string | null>(null);
+  const [draftBusy, setDraftBusy] = useState(false);
 
   const langConfig = useMemo(() => getLanguageConfig(language), [language]);
+
+  // ---- 未提交草稿：检查、恢复、自动保存 ----
+  const draftContextKey = `${currentUser?.id ?? 'anonymous'}::${currentProblem?.id ?? ''}`;
+  const checkedDraftContextRef = useRef<string | null>(null);
+  const draftCheckCompletedRef = useRef(false);
+  /** 仅在草稿检查完成且用户确实编辑过/恢复过草稿后才自动保存，避免把当前内存内容误写成草稿 */
+  const autoSaveEnabledRef = useRef(false);
+  const lastSavedSignatureRef = useRef<string | null>(null);
+  const pendingSnapshotRef = useRef<{ code: string; language: string }>({ code, language });
+  const latestRef = useRef({ code, language, currentUser, currentProblem, draftModalOpen });
+  latestRef.current = { code, language, currentUser, currentProblem, draftModalOpen };
+
+  const draftDiffStats = useMemo<DraftDiffStats | null>(() => {
+    if (!pendingDraft) return null;
+    try {
+      return computeDraftDiff(pendingDraft);
+    } catch {
+      return null;
+    }
+  }, [pendingDraft]);
+
+  /**
+   * 进入题目（切换题目、返回房间重进、断网重连）时检查未提交草稿。
+   * 无草稿或草稿已与初始模板一致时保持当前代码不变，不会发生覆盖。
+   */
+  const runDraftCheck = useCallback(async () => {
+    const user = latestRef.current.currentUser;
+    const problem = latestRef.current.currentProblem;
+    if (!user || !problem) return;
+
+    setDraftChecking(true);
+    setDraftCheckError(null);
+    try {
+      const draft = await getDraft(user.id, problem.id);
+      if (draft && isRecoverableDraft(draft)) {
+        setPendingDraft(draft);
+        setDraftModalOpen(true);
+      } else if (draft) {
+        // 草稿已退化为模板（例如切语言后残留），静默清理
+        try {
+          await removeDraft(user.id, problem.id);
+        } catch {
+          // 清理失败不阻塞使用，下次保存会覆盖
+        }
+      }
+    } catch (error) {
+      setPendingDraft(null);
+      setDraftCheckError(error instanceof Error ? error.message : '读取本地草稿失败');
+      setDraftModalOpen(true);
+    } finally {
+      draftCheckCompletedRef.current = true;
+      autoSaveEnabledRef.current = false;
+      setDraftChecking(false);
+    }
+  }, []);
+
+  // 题目上下文变化时检查一次草稿（只检查一次，防止轮询重复弹窗）
+  useEffect(() => {
+    if (!currentUser?.id || !currentProblem?.id) return;
+    if (checkedDraftContextRef.current === draftContextKey) return;
+    checkedDraftContextRef.current = draftContextKey;
+    draftCheckCompletedRef.current = false;
+    autoSaveEnabledRef.current = false;
+    lastSavedSignatureRef.current = null;
+    pendingSnapshotRef.current = { code, language };
+    void runDraftCheck();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [draftContextKey, currentUser?.id, currentProblem?.id]);
+
+  /** 立即将待保存的快照写入本地草稿；返回是否实际写入 */
+  const flushDraftSnapshot = useCallback((): boolean => {
+    const { currentUser: user, currentProblem: problem } = latestRef.current;
+    if (!user || !problem) return false;
+    const snapshot = pendingSnapshotRef.current;
+    const template = getDefaultCodeByLanguage(snapshot.language);
+    if (snapshot.code.trim() === '' || snapshot.code === template) return false;
+    const signature = `${snapshot.language} ${snapshot.code}`;
+    if (signature === lastSavedSignatureRef.current) return false;
+    saveDraft({
+      problemId: problem.id,
+      userId: user.id,
+      code: snapshot.code,
+      language: snapshot.language,
+      savedAt: new Date().toISOString(),
+    });
+    lastSavedSignatureRef.current = signature;
+    return true;
+  }, []);
+
+  // 题目/用户切换的渲染前一刻，先把上一题目尚未落盘的修改刷入草稿
+  useEffect(() => {
+    const previousContext = checkedDraftContextRef.current;
+    return () => {
+      // 实时读取标记：用户是否曾在当前题目的草稿检查完成后编辑过代码
+      if (previousContext && autoSaveEnabledRef.current) {
+        try {
+          pendingSnapshotRef.current = {
+            code: latestRef.current.code,
+            language: latestRef.current.language,
+          };
+          flushDraftSnapshot();
+        } catch {
+          // 离开题目时的最佳努力保存，失败不打断导航
+        }
+      }
+    };
+  }, [draftContextKey, flushDraftSnapshot]);
+
+  // 代码变化后的防抖自动保存（草稿弹窗期间与未编辑状态不保存）
+  useEffect(() => {
+    if (!draftCheckCompletedRef.current || !autoSaveEnabledRef.current) return;
+    if (draftModalOpen || isRunning || isSubmitting) return;
+    pendingSnapshotRef.current = { code, language };
+
+    const timer = window.setTimeout(() => {
+      try {
+        if (flushDraftSnapshot()) {
+          showStatus('info', '草稿已自动保存');
+        }
+      } catch (error) {
+        showStatus('error', `草稿保存失败：${error instanceof Error ? error.message : '请稍后重试'}`);
+      }
+    }, 800);
+    return () => window.clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [code, language, draftModalOpen, isRunning, isSubmitting]);
+
+  // 关闭页面 / 切到后台时尽量保存最新代码
+  useEffect(() => {
+    const handleFlush = () => {
+      if (!draftCheckCompletedRef.current || !autoSaveEnabledRef.current) return;
+      pendingSnapshotRef.current = { code: latestRef.current.code, language: latestRef.current.language };
+      try {
+        flushDraftSnapshot();
+      } catch {
+        // 页面卸载期间无法可靠提示，忽略
+      }
+    };
+    window.addEventListener('beforeunload', handleFlush);
+    document.addEventListener('visibilitychange', handleFlush);
+    return () => {
+      window.removeEventListener('beforeunload', handleFlush);
+      document.removeEventListener('visibilitychange', handleFlush);
+    };
+  }, [flushDraftSnapshot]);
+
+  const handleEditorChange = useCallback((value: string) => {
+    autoSaveEnabledRef.current = draftCheckCompletedRef.current;
+    setCode(value);
+  }, [setCode]);
+
+  const handleRestoreDraft = useCallback(async () => {
+    const user = latestRef.current.currentUser;
+    const problem = latestRef.current.currentProblem;
+    if (!user || !problem) return;
+
+    setDraftBusy(true);
+    setDraftCheckError(null);
+    try {
+      // 始终以本地最新的草稿内容为准，保证“重试”能读到新写入的数据
+      const draft = await getDraft(user.id, problem.id);
+      if (!isRecoverableDraft(draft)) {
+        throw new Error('草稿不存在或已恢复为初始模板');
+      }
+      applyDraftCode(draft.language, draft.code);
+      autoSaveEnabledRef.current = true;
+      lastSavedSignatureRef.current = `${draft.language} ${draft.code}`;
+      pendingSnapshotRef.current = { code: draft.code, language: draft.language };
+      setPendingDraft(draft);
+      setDraftModalOpen(false);
+      showStatus('success', '已恢复未提交的草稿 ✓');
+    } catch (error) {
+      setDraftCheckError(error instanceof Error ? error.message : '草稿恢复失败，请重试');
+    } finally {
+      setDraftBusy(false);
+    }
+  }, [applyDraftCode]);
+
+  const handleUseTemplate = useCallback(async () => {
+    const user = latestRef.current.currentUser;
+    const problem = latestRef.current.currentProblem;
+    if (!user || !problem || !pendingDraft) return;
+
+    setDraftBusy(true);
+    setDraftCheckError(null);
+    try {
+      // 先清理草稿再重置编辑器，避免异常情况下误覆盖当前代码
+      await removeDraft(user.id, problem.id);
+      lastSavedSignatureRef.current = null;
+      setLanguage(pendingDraft.language);
+      autoSaveEnabledRef.current = false;
+      setPendingDraft(null);
+      setDraftModalOpen(false);
+      showStatus('info', '已使用初始模板，草稿已放弃');
+    } catch (error) {
+      setDraftCheckError(error instanceof Error ? error.message : '放弃草稿失败，请重试');
+    } finally {
+      setDraftBusy(false);
+    }
+  }, [pendingDraft, setLanguage]);
+
+  const handleDismissDraft = useCallback(() => {
+    setDraftModalOpen(false);
+    setDraftCheckError(null);
+    // 保留当前代码与本地草稿，由后续自动保存或再次进入时处理
+  }, []);
+
+  const handleRetryDraftCheck = useCallback(() => {
+    void runDraftCheck();
+  }, [runDraftCheck]);
 
   const codeChangeStats = useMemo(() => {
     if (!codeModified) return { added: 0, removed: 0, total: 0 };
@@ -126,6 +353,18 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
   const confirmLanguageChange = useCallback(() => {
     if (pendingLanguage) {
       setLanguage(pendingLanguage);
+      // 语言切换会重置为新语言模板，旧语言的未提交草稿随之失效
+      const user = latestRef.current.currentUser;
+      const problem = latestRef.current.currentProblem;
+      if (user && problem) {
+        try {
+          removeDraft(user.id, problem.id);
+          lastSavedSignatureRef.current = null;
+        } catch {
+          showStatus('error', '旧草稿清理失败，可稍后重试');
+        }
+      }
+      autoSaveEnabledRef.current = false;
       showStatus('info', `已切换到 ${LANGUAGE_CONFIGS.find(l => l.value === pendingLanguage)?.label || pendingLanguage}`);
     }
     setLanguageConfirmOpen(false);
@@ -260,7 +499,7 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
 
       const passedCount = result.testResults?.filter(t => t.passed).length || 0;
       const totalCount = result.testResults?.length || 0;
-      const isSuccess = result.success && passedCount === totalCount && totalCount > 0;
+      const isSubmitSuccess = result.success && passedCount === totalCount && totalCount > 0;
 
       updateExecutionHistory(historyId, {
         result,
@@ -268,10 +507,20 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
         totalCount,
         runtime: result.runtime,
         memory: result.memory,
-        status: isSuccess ? 'success' : 'failed',
+        status: isSubmitSuccess ? 'success' : 'failed',
       });
 
-      if (result.success) {
+      if (isSubmitSuccess) {
+        // 提交成功后清理对应题目的本地草稿
+        if (currentUser && currentProblem) {
+          try {
+            removeDraft(currentUser.id, currentProblem.id);
+            lastSavedSignatureRef.current = null;
+            autoSaveEnabledRef.current = false;
+          } catch (error) {
+            showStatus('error', `草稿清理失败，可稍后重试：${error instanceof Error ? error.message : ''}`);
+          }
+        }
         showStatus('success', '提交成功 ✓ 所有测试用例通过');
       } else {
         showStatus('error', '提交失败 ✗ 存在未通过的测试用例');
@@ -287,7 +536,7 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
     } finally {
       setIsSubmitting(false);
     }
-  }, [disabled, isRunning, isSubmitting, onSubmit, currentProblem, setIsSubmitting, setLastSubmissionResult, addExecutionHistory, updateExecutionHistory, language, showStatus]);
+  }, [disabled, isRunning, isSubmitting, onSubmit, currentProblem, currentUser, setIsSubmitting, setLastSubmissionResult, addExecutionHistory, updateExecutionHistory, language, showStatus]);
 
   const buttonBaseStyle: React.CSSProperties = {
     padding: '6px 18px',
@@ -790,13 +1039,237 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
         </div>
       )}
 
+      {draftModalOpen && (
+        <div style={{
+          position: 'fixed',
+          top: 0,
+          left: 0,
+          right: 0,
+          bottom: 0,
+          background: 'rgba(0, 0, 0, 0.6)',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          zIndex: 1100,
+        }}>
+          <div style={{
+            background: '#2d2d2d',
+            borderRadius: '8px',
+            padding: '24px',
+            maxWidth: '460px',
+            width: '90%',
+            border: '1px solid #444',
+            boxShadow: '0 4px 20px rgba(0, 0, 0, 0.5)',
+          }}>
+            <h3 style={{ margin: '0 0 12px 0', color: '#fff', fontSize: '16px', display: 'flex', alignItems: 'center', gap: '8px' }}>
+              📝 发现未提交的草稿
+            </h3>
+
+            {draftChecking ? (
+              <p style={{ margin: '0 0 20px 0', color: '#ccc', fontSize: '13px' }}>
+                正在读取本地草稿...
+              </p>
+            ) : draftCheckError ? (
+              <>
+                <p style={{
+                  margin: '0 0 12px 0',
+                  color: '#f44336',
+                  fontSize: '13px',
+                  lineHeight: 1.6,
+                  padding: '10px 12px',
+                  background: 'rgba(244, 67, 54, 0.1)',
+                  border: '1px solid rgba(244, 67, 54, 0.3)',
+                  borderRadius: '6px',
+                }}>
+                  读取草稿失败：{draftCheckError}
+                  <br />
+                  可点击“重试”再次尝试；关闭后不会改动当前代码。
+                </p>
+                <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '10px' }}>
+                  <button
+                    onClick={handleDismissDraft}
+                    disabled={draftBusy}
+                    style={{
+                      padding: '8px 16px',
+                      borderRadius: '6px',
+                      border: '1px solid #555',
+                      background: 'transparent',
+                      color: '#ccc',
+                      cursor: 'pointer',
+                      fontSize: '13px',
+                    }}
+                  >
+                    关闭
+                  </button>
+                  <button
+                    onClick={handleRetryDraftCheck}
+                    style={{
+                      padding: '8px 16px',
+                      borderRadius: '6px',
+                      border: 'none',
+                      background: '#2196f3',
+                      color: '#fff',
+                      cursor: 'pointer',
+                      fontSize: '13px',
+                      fontWeight: 500,
+                    }}
+                  >
+                    重试
+                  </button>
+                </div>
+              </>
+            ) : pendingDraft ? (
+              <>
+                <p style={{ margin: '0 0 16px 0', color: '#ccc', fontSize: '13px', lineHeight: 1.6 }}>
+                  该题目存在未提交且与初始模板不同的代码，是否恢复？
+                </p>
+
+                <div style={{
+                  background: '#252525',
+                  border: '1px solid #3a3a3a',
+                  borderRadius: '6px',
+                  padding: '12px 14px',
+                  marginBottom: '16px',
+                  display: 'flex',
+                  flexDirection: 'column',
+                  gap: '10px',
+                }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                    <div style={{
+                      width: '26px',
+                      height: '26px',
+                      borderRadius: '6px',
+                      background: getLanguageConfig(pendingDraft.language).color,
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                      color: '#1e1e1e',
+                      fontSize: '10px',
+                      fontWeight: 800,
+                      fontFamily: 'monospace',
+                      flexShrink: 0,
+                    }}>
+                      {getLanguageConfig(pendingDraft.language).icon}
+                    </div>
+                    <div style={{ display: 'flex', flexDirection: 'column' }}>
+                      <span style={{ color: '#888', fontSize: '11px' }}>语言</span>
+                      <span style={{ color: '#fff', fontSize: '13px', fontWeight: 600 }}>
+                        {getLanguageConfig(pendingDraft.language).label}
+                      </span>
+                    </div>
+                  </div>
+
+                  <div style={{ height: '1px', background: '#333' }} />
+
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                    <span style={{ fontSize: '14px' }}>🕒</span>
+                    <div style={{ display: 'flex', flexDirection: 'column' }}>
+                      <span style={{ color: '#888', fontSize: '11px' }}>最后修改时间</span>
+                      <span style={{ color: '#fff', fontSize: '12px', fontFamily: 'monospace' }}>
+                        {formatDraftTime(pendingDraft.savedAt)}
+                      </span>
+                    </div>
+                  </div>
+
+                  {draftDiffStats && (
+                    <>
+                      <div style={{ height: '1px', background: '#333' }} />
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+                        <span style={{ color: '#888', fontSize: '11px' }}>与初始模板的差异概况</span>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '12px', fontSize: '11px', fontFamily: 'monospace' }}>
+                          <span style={{ color: '#4caf50', fontWeight: 700 }}>+{draftDiffStats.added} 行</span>
+                          <span style={{ color: '#f44336', fontWeight: 700 }}>-{draftDiffStats.removed} 行</span>
+                          <span style={{ color: '#888' }}>
+                            {draftDiffStats.templateLines} → {draftDiffStats.draftLines} 行
+                          </span>
+                        </div>
+                        <div style={{
+                          height: '6px',
+                          borderRadius: '3px',
+                          background: '#1a1a1a',
+                          display: 'flex',
+                          overflow: 'hidden',
+                        }}>
+                          <div style={{
+                            width: `${Math.min(100, (draftDiffStats.added / Math.max(1, draftDiffStats.draftLines)) * 100)}%`,
+                            background: '#4caf50',
+                          }} />
+                          <div style={{
+                            width: `${Math.min(100, (draftDiffStats.removed / Math.max(1, draftDiffStats.templateLines)) * 100)}%`,
+                            background: '#f44336',
+                            opacity: 0.7,
+                          }} />
+                        </div>
+                      </div>
+                    </>
+                  )}
+                </div>
+
+                <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '10px' }}>
+                  <button
+                    onClick={handleDismissDraft}
+                    disabled={draftBusy}
+                    style={{
+                      padding: '8px 14px',
+                      borderRadius: '6px',
+                      border: '1px solid #555',
+                      background: 'transparent',
+                      color: '#888',
+                      cursor: draftBusy ? 'not-allowed' : 'pointer',
+                      fontSize: '12px',
+                    }}
+                  >
+                    暂不处理
+                  </button>
+                  <button
+                    onClick={handleUseTemplate}
+                    disabled={draftBusy}
+                    style={{
+                      padding: '8px 16px',
+                      borderRadius: '6px',
+                      border: '1px solid #555',
+                      background: 'transparent',
+                      color: '#ccc',
+                      cursor: draftBusy ? 'not-allowed' : 'pointer',
+                      fontSize: '13px',
+                    }}
+                  >
+                    {draftBusy ? '处理中...' : '使用模板'}
+                  </button>
+                  <button
+                    onClick={handleRestoreDraft}
+                    disabled={draftBusy}
+                    style={{
+                      padding: '8px 16px',
+                      borderRadius: '6px',
+                      border: 'none',
+                      background: '#2196f3',
+                      color: '#fff',
+                      cursor: draftBusy ? 'not-allowed' : 'pointer',
+                      fontSize: '13px',
+                      fontWeight: 500,
+                    }}
+                  >
+                    {draftBusy ? '处理中...' : '恢复草稿'}
+                  </button>
+                </div>
+              </>
+            ) : null}
+          </div>
+        </div>
+      )}
+
       <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
         <div style={{ flex: lastRunResult || lastSubmissionResult ? '0 0 60%' : '1', overflow: 'hidden', minHeight: '200px' }}>
           <Editor
             height="100%"
             language={language}
             value={code}
-            onChange={(v) => setCode(v || '')}
+            onChange={(v, ev) => {
+              // isFlush 表示值由外部程序化设置（切语言/恢复草稿），不算用户编辑
+              if (ev?.isFlush) return;
+              handleEditorChange(v || '');
+            }}
             theme="vs-dark"
             options={{
               fontSize: 14,
