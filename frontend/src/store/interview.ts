@@ -54,6 +54,8 @@ interface InterviewState {
   setProblem: (p: Problem) => void;
   setCode: (code: string) => void;
   setLanguage: (lang: string) => void;
+  /** 恢复未提交草稿：以草稿语言和内容覆盖当前编辑器，差异基线仍为该语言初始模板 */
+  applyDraftCode: (language: string, code: string) => void;
   setIsRunning: (running: boolean) => void;
   setIsSubmitting: (submitting: boolean) => void;
   setLastRunResult: (result: ExecutionResult | null) => void;
@@ -101,6 +103,14 @@ export const useInterviewStore = create<InterviewState>((set) => ({
       executionHistory: [],
     });
   },
+  applyDraftCode: (lang, draftCode) => set({
+    language: lang,
+    code: draftCode,
+    originalCode: getDefaultCodeByLanguage(lang),
+    lastRunResult: null,
+    lastSubmissionResult: null,
+    executionHistory: [],
+  }),
   setIsRunning: (running) => set({ isRunning: running }),
   setIsSubmitting: (submitting) => set({ isSubmitting: submitting }),
   setLastRunResult: (result) => set({ lastRunResult: result }),
@@ -161,6 +171,9 @@ export const useInterviewStore = create<InterviewState>((set) => ({
     lastRunResult: null,
     lastSubmissionResult: null,
     statusChangeNotification: null,
+    language: 'javascript',
+    code: getDefaultCodeByLanguage('javascript'),
+    originalCode: getDefaultCodeByLanguage('javascript'),
   }),
   setProblems: (problems) => set({ problems }),
   addProblem: (problem) => set((state) => ({ problems: [problem, ...state.problems] })),

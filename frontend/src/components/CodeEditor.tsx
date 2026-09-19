@@ -1,8 +1,17 @@
-import React, { useState, useCallback, useEffect, useMemo } from 'react';
+import React, { useState, useCallback, useEffect, useMemo, useRef } from 'react';
 import Editor from '@monaco-editor/react';
 import { useInterviewStore, ExecutionResult } from '../store/interview';
 import { SubmissionResult } from './SubmissionResult';
-import { LANGUAGE_CONFIGS, getLanguageConfig, LanguageConfig } from '../types';
+import { LANGUAGE_CONFIGS, getLanguageConfig, getDefaultCodeByLanguage, LanguageConfig } from '../types';
+import { DraftRecoveryDialog } from './DraftRecoveryDialog';
+import {
+  CodeDraft,
+  getDraft,
+  restoreDraft,
+  deleteDraft,
+  saveDraftSync,
+  deleteDraftSync,
+} from '../services/draftService';
 
 interface CodeEditorProps {
   disabled?: boolean;
@@ -24,6 +33,7 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
     setCode,
     language,
     setLanguage,
+    applyDraftCode,
     originalCode,
     isRunning,
     isSubmitting,
@@ -33,7 +43,9 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
     setLastSubmissionResult,
     addExecutionHistory,
     updateExecutionHistory,
+    resetOriginalCode,
     currentProblem,
+    currentRoom,
     lastRunResult,
     lastSubmissionResult,
     executionHistory,
@@ -45,6 +57,32 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
   const [codeModified, setCodeModified] = useState(false);
   const [codeChangeIndicator, setCodeChangeIndicator] = useState(false);
   const [showLanguageDropdown, setShowLanguageDropdown] = useState(false);
+
+  // 未提交草稿恢复相关状态
+  const [draftPrompt, setDraftPrompt] = useState<CodeDraft | null>(null);
+  const [draftRestoring, setDraftRestoring] = useState(false);
+  const [draftError, setDraftError] = useState<string | null>(null);
+  const roomId = currentRoom?.id;
+  const problemId = currentProblem?.id;
+  const sessionKey = roomId && problemId ? `${roomId}__${problemId}` : null;
+  const sessionKeyRef = useRef<string | null>(null);
+  /** 当前会话是否已完成初始化（加载模板/草稿），完成前禁止自动保存草稿 */
+  const sessionReadyRef = useRef(false);
+  /** 会话初始化令牌，仅最新一次初始化允许更新状态（兼容 StrictMode 双挂载） */
+  const initTokenRef = useRef(0);
+  const autoSaveTimerRef = useRef<number | null>(null);
+  /** 供卸载/页面隐藏时立即落盘最新代码 */
+  const latestCodeRef = useRef({ code, language, roomId: roomId ?? '', problemId: problemId ?? '', ready: false });
+
+  useEffect(() => {
+    latestCodeRef.current = {
+      code,
+      language,
+      roomId: roomId ?? '',
+      problemId: problemId ?? '',
+      ready: sessionReadyRef.current,
+    };
+  }, [code, language, roomId, problemId]);
 
   const langConfig = useMemo(() => getLanguageConfig(language), [language]);
 
@@ -68,6 +106,10 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
     return { added, removed, total: added + removed };
   }, [code, originalCode, codeModified]);
 
+  const showStatus = useCallback((type: 'success' | 'error' | 'info', text: string) => {
+    setStatusMessage({ type, text });
+  }, []);
+
   useEffect(() => {
     setCodeModified(code !== originalCode);
     if (code !== originalCode) {
@@ -76,6 +118,144 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
       return () => clearTimeout(timer);
     }
   }, [code, originalCode]);
+
+  // 进入「房间 + 题目」会话：先重置为初始模板（无草稿时不会被覆盖），
+  // 再检查是否存在未提交草稿，若有则提示恢复。
+  useEffect(() => {
+    if (!sessionKey || !roomId || !problemId) {
+      sessionReadyRef.current = false;
+      return;
+    }
+
+    // 同一会话（轮询刷新等）不重复初始化。StrictMode 双挂载时旧运行会使
+    // token 失效，只有最新一次初始化可以更新状态。
+    if (sessionKeyRef.current === sessionKey) return;
+    sessionKeyRef.current = sessionKey;
+    sessionReadyRef.current = false;
+    initTokenRef.current += 1;
+    const initToken = initTokenRef.current;
+
+    const initSession = async () => {
+      // 先重置为初始模板，确保不会把上个题目/会话的代码带入
+      setLanguage('javascript');
+      setDraftPrompt(null);
+      setDraftError(null);
+
+      try {
+        const draft = await getDraft(roomId, problemId);
+        if (initTokenRef.current !== initToken) return;
+        if (draft) {
+          setDraftPrompt(draft);
+        }
+      } catch (err) {
+        if (initTokenRef.current !== initToken) return;
+        // 草稿存储暂不可用：保留初始模板，给出错误条，不自动重试以免打扰
+        showStatus('error', `读取本地草稿失败：${err instanceof Error ? err.message : '未知错误'}`);
+      } finally {
+        if (initTokenRef.current === initToken) {
+          sessionReadyRef.current = true;
+        }
+      }
+    };
+
+    initSession();
+
+    return () => {
+      // 卸载即令本次初始化失效（兼容 StrictMode 双挂载）；
+      // 若初始化尚未完成，复位会话标记，下次挂载可重新初始化。
+      initTokenRef.current += 1;
+      if (!sessionReadyRef.current) {
+        sessionKeyRef.current = null;
+      }
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sessionKey, roomId, problemId]);
+
+  // 防抖自动保存草稿（仅在会话初始化完成后）
+  useEffect(() => {
+    if (!sessionKey || !roomId || !problemId) return;
+    if (!sessionReadyRef.current) return;
+    // 草稿恢复弹窗未处理前不保存，避免覆盖/重建即将恢复的草稿
+    if (draftPrompt) return;
+
+    if (autoSaveTimerRef.current) {
+      clearTimeout(autoSaveTimerRef.current);
+    }
+
+    const latestCode = code;
+    const latestLanguage = language;
+    autoSaveTimerRef.current = window.setTimeout(() => {
+      try {
+        saveDraftSync({ roomId, problemId, language: latestLanguage, code: latestCode });
+      } catch (err) {
+        // 保存失败不阻塞编辑，稍后由下一次修改自动重试
+        showStatus('error', `草稿自动保存失败：${err instanceof Error ? err.message : '未知错误'}`);
+      }
+    }, 800);
+
+    return () => {
+      if (autoSaveTimerRef.current) {
+        clearTimeout(autoSaveTimerRef.current);
+      }
+    };
+  }, [code, language, sessionKey, roomId, problemId, draftPrompt]);
+
+  // 离开页面/隐藏时立即把待保存的修改落盘，防止丢失最后的输入
+  useEffect(() => {
+    const flushPendingDraft = () => {
+      const { code: latestCode, language: latestLanguage, roomId: rId, problemId: pId, ready } = latestCodeRef.current;
+      if (!rId || !pId || !ready) return;
+      try {
+        saveDraftSync({ roomId: rId, problemId: pId, language: latestLanguage, code: latestCode });
+      } catch {
+        /* 页面卸载阶段无法提示，忽略 */
+      }
+    };
+    const handleVisibility = () => {
+      if (document.visibilityState === 'hidden') flushPendingDraft();
+    };
+    window.addEventListener('pagehide', flushPendingDraft);
+    document.addEventListener('visibilitychange', handleVisibility);
+    return () => {
+      flushPendingDraft();
+      window.removeEventListener('pagehide', flushPendingDraft);
+      document.removeEventListener('visibilitychange', handleVisibility);
+    };
+  }, []);
+
+  const handleRestoreDraft = useCallback(async () => {
+    if (!roomId || !problemId || !draftPrompt) return;
+    setDraftRestoring(true);
+    setDraftError(null);
+    try {
+      const draft = await restoreDraft(roomId, problemId);
+      if (draft.roomId !== roomId || draft.problemId !== problemId) {
+        throw new Error('草稿与当前题目不匹配');
+      }
+      applyDraftCode(draft.language, draft.code);
+      setDraftPrompt(null);
+      showStatus('success', '已恢复未提交的代码草稿');
+    } catch (err) {
+      // 恢复失败保留弹窗，用户可重试或选择使用模板
+      setDraftError(err instanceof Error ? err.message : '未知错误');
+    } finally {
+      setDraftRestoring(false);
+    }
+  }, [roomId, problemId, draftPrompt, applyDraftCode, showStatus]);
+
+  const handleUseTemplate = useCallback(async () => {
+    if (!roomId || !problemId || !draftPrompt) return;
+    // 放弃草稿：当前已是初始模板，只需清除已保存的草稿
+    try {
+      await deleteDraft(roomId, problemId);
+    } catch (err) {
+      // 即使删除失败也继续使用模板，并提示用户（下次进入仍可能再次提示）
+      showStatus('error', `草稿清除失败：${err instanceof Error ? err.message : '未知错误'}`);
+    }
+    setDraftPrompt(null);
+    setDraftError(null);
+    showStatus('info', '已使用初始模板');
+  }, [roomId, problemId, draftPrompt, showStatus]);
 
   const latestSubmission = useMemo(() => {
     return executionHistory.find(h => h.type === 'submit') || executionHistory[0];
@@ -106,10 +286,6 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
     }
   }, [statusMessage]);
 
-  const showStatus = useCallback((type: 'success' | 'error' | 'info', text: string) => {
-    setStatusMessage({ type, text });
-  }, []);
-
   const handleLanguageSelect = useCallback((newLang: string) => {
     setShowLanguageDropdown(false);
     if (newLang === language) return;
@@ -118,19 +294,26 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
       setPendingLanguage(newLang);
       setLanguageConfirmOpen(true);
     } else {
+      // 切换语言会重置为新语言模板，旧语言草稿不再适用于当前编辑
+      if (roomId && problemId) {
+        try { deleteDraftSync(roomId, problemId); } catch { /* 忽略清理失败 */ }
+      }
       setLanguage(newLang);
       showStatus('info', `已切换到 ${LANGUAGE_CONFIGS.find(l => l.value === newLang)?.label || newLang}`);
     }
-  }, [language, codeModified, code, setLanguage, showStatus]);
+  }, [language, codeModified, code, setLanguage, showStatus, roomId, problemId]);
 
   const confirmLanguageChange = useCallback(() => {
     if (pendingLanguage) {
+      if (roomId && problemId) {
+        try { deleteDraftSync(roomId, problemId); } catch { /* 忽略清理失败 */ }
+      }
       setLanguage(pendingLanguage);
       showStatus('info', `已切换到 ${LANGUAGE_CONFIGS.find(l => l.value === pendingLanguage)?.label || pendingLanguage}`);
     }
     setLanguageConfirmOpen(false);
     setPendingLanguage(null);
-  }, [pendingLanguage, setLanguage, showStatus]);
+  }, [pendingLanguage, setLanguage, showStatus, roomId, problemId]);
 
   const getTimeAgo = (dateString: string) => {
     const diff = Date.now() - new Date(dateString).getTime();
@@ -272,6 +455,11 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
       });
 
       if (result.success) {
+        // 提交成功：清理对应草稿，并以已提交代码作为新的差异基线
+        if (roomId && problemId) {
+          try { deleteDraftSync(roomId, problemId); } catch { /* 忽略清理失败 */ }
+        }
+        resetOriginalCode();
         showStatus('success', '提交成功 ✓ 所有测试用例通过');
       } else {
         showStatus('error', '提交失败 ✗ 存在未通过的测试用例');
@@ -287,7 +475,7 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
     } finally {
       setIsSubmitting(false);
     }
-  }, [disabled, isRunning, isSubmitting, onSubmit, currentProblem, setIsSubmitting, setLastSubmissionResult, addExecutionHistory, updateExecutionHistory, language, showStatus]);
+  }, [disabled, isRunning, isSubmitting, onSubmit, currentProblem, setIsSubmitting, setLastSubmissionResult, addExecutionHistory, updateExecutionHistory, language, showStatus, roomId, problemId, resetOriginalCode]);
 
   const buttonBaseStyle: React.CSSProperties = {
     padding: '6px 18px',
@@ -790,6 +978,17 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
         </div>
       )}
 
+      {draftPrompt && (
+        <DraftRecoveryDialog
+          draft={draftPrompt}
+          templateCode={getDefaultCodeByLanguage(draftPrompt.language)}
+          restoring={draftRestoring}
+          error={draftError}
+          onRestore={handleRestoreDraft}
+          onUseTemplate={handleUseTemplate}
+        />
+      )}
+
       <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
         <div style={{ flex: lastRunResult || lastSubmissionResult ? '0 0 60%' : '1', overflow: 'hidden', minHeight: '200px' }}>
           <Editor
@@ -802,7 +1001,7 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
               fontSize: 14,
               minimap: { enabled: false },
               wordWrap: 'on',
-              readOnly: disabled,
+              readOnly: disabled || !!draftPrompt,
               automaticLayout: true,
             }}
           />
